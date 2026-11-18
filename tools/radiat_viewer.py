@@ -47,8 +47,13 @@ SNAPSHOT_DIR = TOOLS_DIR / "snapshots"
 HIT_RE = re.compile(r"\[HIT\] X=(\d+), Y=(\d+), Energy=(\d+), Sum=(\d+), T=(\d+)")
 STAT_RE = re.compile(
     r"\[STAT\] CPS=(\d+), CPM=(\d+), Total=(\d+), FPS=([\d.]+), Drop=(\d+), Cal=([01])"
+    r"(?:, Masked=(\d+))?"  # マスク機能より前のファームには無い
 )
 CFG_RE = re.compile(r"\[CFG\] W=(\d+), H=(\d+), TH=(\d+), GAIN=(\d+), EXP=(\d+)")
+MASK_RE = re.compile(r"\[MASK\] n=\d+((?: \d+,\d+)*)$")
+POINT_RE = re.compile(r"(\d+),(\d+)")
+MASK_INPUT_RE = re.compile(r"^\s*(\d+)\s*,\s*(\d+)\s*$")
+MASK_COLOR = (255, 64, 255)
 NON_PRINTABLE = re.compile(r"[^\x20-\x7e]")
 
 
@@ -69,6 +74,7 @@ class Stat:
     fps: float
     drop: int
     calibrating: bool
+    masked: int = 0  # ノイズ画素マスクに当たって捨てたイベント数
 
 
 @dataclasses.dataclass
@@ -80,16 +86,47 @@ class Config:
     exposure: int
 
 
+@dataclasses.dataclass
+class MaskList:
+    points: list  # [(x, y), ...] 各点の周囲 3x3 が検出から外れる
+
+
 def parse_line(text):
-    """1 行を Hit / Stat / Config に変換する。それ以外のログは文字列のまま返す。"""
+    """1 行を Hit / Stat / Config / MaskList に変換する。それ以外のログは文字列のまま返す。"""
     if match := HIT_RE.match(text):
         return Hit(*map(int, match.groups()))
     if match := STAT_RE.match(text):
-        cps, cpm, total, fps, drop, cal = match.groups()
-        return Stat(int(cps), int(cpm), int(total), float(fps), int(drop), cal == "1")
+        cps, cpm, total, fps, drop, cal, masked = match.groups()
+        return Stat(int(cps), int(cpm), int(total), float(fps), int(drop), cal == "1",
+                    int(masked or 0))
     if match := CFG_RE.match(text):
         return Config(*map(int, match.groups()))
+    if match := MASK_RE.match(text):
+        return MaskList([(int(x), int(y)) for x, y in POINT_RE.findall(match.group(1))])
     return text
+
+
+def find_repeats(hits, min_count=2):
+    """同じ画素 (3x3 以内) で繰り返し出たヒットを、ノイズ画素の候補として返す。
+
+    戻り値は [(x, y, 回数, [エネルギー...]), ...] で回数の多い順。x, y はそのうち最も多く
+    出た画素。偶然の重なりもあり得るので、背景測定で何度も出るものだけをマスクすること。
+    """
+    by_pixel = collections.defaultdict(list)
+    for hit in hits:
+        by_pixel[(hit.x, hit.y)].append(hit.energy)
+    groups = []
+    for (x, y) in by_pixel:
+        energies = [e for (nx, ny), es in by_pixel.items()
+                    if abs(nx - x) <= 1 and abs(ny - y) <= 1 for e in es]
+        if len(energies) >= min_count:
+            groups.append((len(energies), len(by_pixel[(x, y)]), x, y, energies))
+    groups.sort(key=lambda g: (-g[0], -g[1]))
+    result = []
+    for count, _, x, y, energies in groups:
+        if all(abs(x - rx) > 1 or abs(y - ry) > 1 for rx, ry, _, _ in result):
+            result.append((x, y, count, sorted(energies)))
+    return result
 
 
 def split_lines(buffer, data):
@@ -143,10 +180,12 @@ class HitMap:
         self.energy_hist = [0] * HISTOGRAM_BINS
         self.sum_hist = [0] * HISTOGRAM_BINS
         self.hits = 0
+        self.history = []  # find_repeats 用
 
     def add(self, hit):
         if not (0 <= hit.x < self.width and 0 <= hit.y < self.height):
             return
+        self.history.append(hit)
         index = hit.y * self.width + hit.x
         self.counts[index] = min(255, self.counts[index] + 1)
         self.energy_hist[min(hit.energy, HISTOGRAM_BINS - 1)] += 1
@@ -170,8 +209,16 @@ class HitMap:
         image.putpalette(HEATMAP_PALETTE)
         return image.convert("RGB")
 
-    def render(self, mode):
-        return self.heatmap() if mode == "heatmap" else self.points.copy()
+    def render(self, mode, masks=()):
+        """masks の各点の周囲 3x3 (検出から外れる範囲) を枠で示す。"""
+        image = self.heatmap() if mode == "heatmap" else self.points.copy()
+        draw = ImageDraw.Draw(image)
+        for x, y in masks:
+            margin = 3  # 1 画素の大きさによらず見えるように枠を少し広げる
+            draw.rectangle(((x - 1) * self.scale - margin, (y - 1) * self.scale - margin,
+                            (x + 2) * self.scale + margin, (y + 2) * self.scale + margin),
+                           outline=MASK_COLOR, width=2)
+        return image
 
 
 def to_png(image):
@@ -372,11 +419,25 @@ def build_window(view_size):
         [sg.Text("", key="-MEASURE-", size=(90, 1), font=("Consolas", 13, "bold"),
                  text_color="#ffee58")],
         [
-            sg.Image(key="-MAP-", size=view_size, background_color="black"),
+            sg.Column([[sg.Image(key="-MAP-", size=view_size, background_color="black")]],
+                      vertical_alignment="top", pad=(0, 0)),
             sg.Column([
                 [sg.Graph(CHART_SIZE, (0, 0), CHART_SIZE, key="-HIST-", background_color="black")],
                 [sg.Graph(CHART_SIZE, (0, 0), CHART_SIZE, key="-RATE-", background_color="black")],
-            ]),
+                [
+                    sg.Text("Noise mask x,y"),
+                    sg.Input("", key="-MASKXY-", size=(9, 1)),
+                    sg.Button("Add", key="-MASKADD-", disabled=True,
+                              tooltip="その画素の周囲 3x3 を検出から外す (ESP32 に保存される)"),
+                    sg.Button("Remove", key="-MASKDEL-", disabled=True),
+                ],
+                [
+                    sg.Button("Find repeats", key="-REPEATS-",
+                              tooltip="この計測で同じ画素に 2 回以上出たヒットをログに出す"),
+                    sg.Button("Clear masks", key="-MASKCLR-", disabled=True),
+                ],
+                [sg.Text("Masks: -", key="-MASKS-", size=(48, 2), font=("Consolas", 9))],
+            ], vertical_alignment="top"),
         ],
         [sg.Text("Not connected", key="-STATUS-", size=(110, 1), font=("Consolas", 10))],
         [sg.Multiline(key="-LOG-", size=(130, 8), disabled=True, autoscroll=True,
@@ -387,7 +448,7 @@ def build_window(view_size):
 
 def set_connected(window, connected):
     window["-CONNECT-"].update("Disconnect" if connected else "Connect")
-    for key in ("-APPLY-", "-CAL-", "-INFO-"):
+    for key in ("-APPLY-", "-CAL-", "-INFO-", "-MASKADD-", "-MASKDEL-", "-MASKCLR-"):
         window[key].update(disabled=not connected)
 
 
@@ -398,6 +459,7 @@ def main():
     measurement = None  # Reset するまでは None (経過時間・CSV なし)
     config = None
     last_stat = None
+    masks = []  # ESP32 の [MASK] 行で更新される
     rate_history = collections.deque(maxlen=RATE_HISTORY_S)
     map_dirty = chart_dirty = True
     next_map = next_chart = 0.0
@@ -418,8 +480,9 @@ def main():
             return
         total = last_stat.total if last_stat is not None else "?"
         drop = last_stat.drop if last_stat is not None else "?"
+        masked = last_stat.masked if last_stat is not None else "?"
         log(f"[PC] saved {path.name} ({format_elapsed(measurement.elapsed())}, "
-            f"Total {total}, PC hits {hitmap.hits}, Drop {drop})")
+            f"Total {total}, PC hits {hitmap.hits}, Drop {drop}, Masked {masked})")
 
     def finish_measurement():
         nonlocal measurement
@@ -497,8 +560,28 @@ def main():
         elif event == "-SAVE-":
             SNAPSHOT_DIR.mkdir(exist_ok=True)
             path = SNAPSHOT_DIR / f"hitmap_{time.strftime('%Y%m%d_%H%M%S')}_{values['-MODE-']}.png"
-            hitmap.render(values["-MODE-"]).save(path)
+            hitmap.render(values["-MODE-"], masks).save(path)
             log(f"[PC] saved {path}")
+        elif event in ("-MASKADD-", "-MASKDEL-") and connection is not None:
+            match = MASK_INPUT_RE.match(values["-MASKXY-"])
+            if match is None:
+                log(f"[PC] mask point must be 'x,y': {values['-MASKXY-']}")
+            else:
+                prefix = "m=" if event == "-MASKADD-" else "m-="
+                connection.send(f"{prefix}{match.group(1)},{match.group(2)}")
+        elif event == "-MASKCLR-" and connection is not None:
+            if sg.popup_yes_no("ESP32 に保存されているマスクを全て削除しますか？",
+                               title="Clear masks") == "Yes":
+                connection.send("m=clear")
+        elif event == "-REPEATS-":
+            repeats = find_repeats(hitmap.history)
+            if not repeats:
+                log(f"[PC] no repeated pixels in {hitmap.hits} hits")
+            for x, y, count, energies in repeats:
+                log(f"[PC] repeat {x},{y} x{count} energy={energies}")
+            if repeats:
+                # いちばん多いものを入力欄に入れておく (Add で登録できる)
+                window["-MASKXY-"].update(f"{repeats[0][0]},{repeats[0][1]}")
 
         if connection is not None:
             try:
@@ -533,6 +616,12 @@ def main():
                         window["-TH-"].update(value=message.threshold)
                         window["-GAIN-"].update(value=message.gain)
                         window["-EXP-"].update(value=message.exposure)
+                    elif isinstance(message, MaskList):
+                        log(text)
+                        masks = message.points
+                        window["-MASKS-"].update(
+                            "Masks: " + (" ".join(f"{x},{y}" for x, y in masks) or "none"))
+                        map_dirty = True
                     elif text == "[OK] reset":
                         log(text)
                         start_measurement(values["-REC-"])
@@ -543,7 +632,7 @@ def main():
 
         now = time.monotonic()
         if map_dirty and now >= next_map:
-            window["-MAP-"].update(data=to_png(hitmap.render(values["-MODE-"])))
+            window["-MAP-"].update(data=to_png(hitmap.render(values["-MODE-"], masks)))
             map_dirty = False
             next_map = now + MAP_REFRESH_S
         if chart_dirty and now >= next_chart:
@@ -561,7 +650,7 @@ def main():
             if last_stat is not None:
                 s = last_stat
                 status = (f"CPS {s.cps:>4} | CPM {s.cpm:>6} | Total {s.total:>7} | "
-                          f"FPS {s.fps:4.1f} | Drop {s.drop} | " + status)
+                          f"FPS {s.fps:4.1f} | Drop {s.drop} | Masked {s.masked} | " + status)
                 if s.calibrating:
                     status += " | CALIBRATING"
             if config is not None:

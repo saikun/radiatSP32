@@ -8,8 +8,9 @@
 //
 // シリアル出力 (1 行 1 メッセージ。tools/radiat_viewer.py の正規表現と一致させること):
 //   [HIT] X=123, Y=45, Energy=67, Sum=210, T=123456
-//   [STAT] CPS=3, CPM=180, Total=1234, FPS=25.0, Drop=0, Cal=0
+//   [STAT] CPS=3, CPM=180, Total=1234, FPS=25.0, Drop=0, Cal=0, Masked=2
 //   [CFG] W=400, H=296, TH=25, GAIN=30, EXP=1200   (起動時の標準設定)
+//   [MASK] n=1 399,164
 //   [CAL] start / [CAL] done ...
 // コマンド (改行区切り):
 //   t=30   閾値 (1-255)
@@ -18,8 +19,13 @@
 //   c      再キャリブレーション
 //   r      計測のリセット (Total・Drop・CPM とヒットマップ。未送信のヒットも捨てる)
 //   info   設定の再送
+//   m          ノイズ画素マスクの一覧
+//   m=399,164  マスク追加 (周囲 3x3 を検出から外す。NVS に保存され電源断後も残る)
+//   m-=399,164 その点を含むマスクを削除
+//   m=clear    マスクを全削除
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 
@@ -76,6 +82,137 @@ std::atomic<bool> g_calibrating{false};
 std::atomic<uint32_t> g_frameCount{0};
 std::atomic<uint32_t> g_hitCount{0};
 std::atomic<uint32_t> g_dropCount{0};  // Queue 満杯で送れなかったイベント数
+std::atomic<uint32_t> g_maskedCount{0};  // マスクに当たって捨てたイベント数
+
+// ============================================================================
+// ノイズ画素マスク
+// ============================================================================
+// 長時間の背景測定で繰り返し光る画素 (ランダムに跳ねるノイズ画素) を登録して検出から外す。
+// その画素はピーク位置が隣の画素とのあいだで揺れるので、登録点の周囲 3x3 をまとめて外す。
+// 登録内容は NVS (内蔵 Flash) に保存し、電源を切っても残す。
+
+constexpr int kMaxMasks = 32;
+constexpr const char *kPrefsNamespace = "radiat";
+constexpr const char *kPrefsMaskKey = "mask";
+
+struct MaskPoint {
+  uint16_t x;
+  uint16_t y;
+};
+
+MaskPoint g_masks[kMaxMasks];
+int g_maskCount = 0;
+// Core 0 (検出) が読み、Core 1 (コマンド) が書くので排他する
+portMUX_TYPE g_maskMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool isMasked(int x, int y) {
+  bool masked = false;
+  portENTER_CRITICAL(&g_maskMux);
+  for (int i = 0; i < g_maskCount; i++) {
+    if (abs(x - g_masks[i].x) <= 1 && abs(y - g_masks[i].y) <= 1) {
+      masked = true;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_maskMux);
+  return masked;
+}
+
+int copyMasks(MaskPoint *out) {
+  portENTER_CRITICAL(&g_maskMux);
+  const int count = g_maskCount;
+  memcpy(out, g_masks, sizeof(MaskPoint) * count);
+  portEXIT_CRITICAL(&g_maskMux);
+  return count;
+}
+
+void loadMasks() {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, false)) return;
+  if (prefs.isKey(kPrefsMaskKey)) {
+    const size_t length = prefs.getBytesLength(kPrefsMaskKey);
+    if (length % sizeof(MaskPoint) == 0 && length <= sizeof(g_masks)) {
+      MaskPoint loaded[kMaxMasks];
+      prefs.getBytes(kPrefsMaskKey, loaded, length);
+      portENTER_CRITICAL(&g_maskMux);
+      memcpy(g_masks, loaded, length);
+      g_maskCount = length / sizeof(MaskPoint);
+      portEXIT_CRITICAL(&g_maskMux);
+    }
+  }
+  prefs.end();
+}
+
+// Flash への書き込み中は一瞬キャッシュが止まるので、カメラのフレームを 1 枚落とすことがある
+void saveMasks() {
+  MaskPoint copy[kMaxMasks];
+  const int count = copyMasks(copy);
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, false)) {
+    Serial.println("[ERR] mask save failed (NVS)");
+    return;
+  }
+  if (count == 0) {
+    prefs.remove(kPrefsMaskKey);
+  } else {
+    prefs.putBytes(kPrefsMaskKey, copy, sizeof(MaskPoint) * count);
+  }
+  prefs.end();
+}
+
+// 同じ点の再登録は成功扱い。上限に達していたら false
+bool addMask(int x, int y) {
+  bool ok = true;
+  portENTER_CRITICAL(&g_maskMux);
+  bool exists = false;
+  for (int i = 0; i < g_maskCount; i++) {
+    if (g_masks[i].x == x && g_masks[i].y == y) exists = true;
+  }
+  if (!exists) {
+    if (g_maskCount < kMaxMasks) {
+      g_masks[g_maskCount++] = {static_cast<uint16_t>(x), static_cast<uint16_t>(y)};
+    } else {
+      ok = false;
+    }
+  }
+  portEXIT_CRITICAL(&g_maskMux);
+  return ok;
+}
+
+// (x, y) を含むマスクをすべて外す。外したものが無ければ false
+bool removeMask(int x, int y) {
+  bool removed = false;
+  portENTER_CRITICAL(&g_maskMux);
+  int kept = 0;
+  for (int i = 0; i < g_maskCount; i++) {
+    if (abs(x - g_masks[i].x) <= 1 && abs(y - g_masks[i].y) <= 1) {
+      removed = true;
+    } else {
+      g_masks[kept++] = g_masks[i];
+    }
+  }
+  g_maskCount = kept;
+  portEXIT_CRITICAL(&g_maskMux);
+  return removed;
+}
+
+void clearMasks() {
+  portENTER_CRITICAL(&g_maskMux);
+  g_maskCount = 0;
+  portEXIT_CRITICAL(&g_maskMux);
+}
+
+// 例: "[MASK] n=2 399,164 10,20"  (他のタスクの出力と混ざらないよう 1 回で書き出す)
+void printMasks() {
+  MaskPoint copy[kMaxMasks];
+  const int count = copyMasks(copy);
+  char line[16 + kMaxMasks * 9];
+  int length = snprintf(line, sizeof(line), "[MASK] n=%d", count);
+  for (int i = 0; i < count; i++) {
+    length += snprintf(line + length, sizeof(line) - length, " %u,%u", copy[i].x, copy[i].y);
+  }
+  Serial.println(line);
+}
 
 // ============================================================================
 // カメラ
@@ -234,6 +371,10 @@ uint32_t detectHits(const uint8_t *frame, uint32_t timestampMs) {
       if (diff <= threshold) continue;
       RadiationEvent event;
       if (!examineCluster(frame, x, y, diff, &event.sum)) continue;
+      if (isMasked(x, y)) {
+        g_maskedCount++;
+        continue;
+      }
       event.x = x;
       event.y = y;
       event.energy = static_cast<uint8_t>(diff);
@@ -409,6 +550,7 @@ class Statistics {
     lastFrames_ = g_frameCount.load();
     totalOffset_ = lastHits_;
     dropOffset_ = g_dropCount.load();
+    maskedOffset_ = g_maskedCount.load();
     count_ = 0;
     index_ = 0;
   }
@@ -439,11 +581,12 @@ class Statistics {
     const uint32_t cpm = count_ == 0 ? 0 : sum * kCpmWindow / count_;
     const uint32_t total = hits - totalOffset_;
 
-    Serial.printf("[STAT] CPS=%lu, CPM=%lu, Total=%lu, FPS=%.1f, Drop=%lu, Cal=%d\n",
+    Serial.printf("[STAT] CPS=%lu, CPM=%lu, Total=%lu, FPS=%.1f, Drop=%lu, Cal=%d, Masked=%lu\n",
                   static_cast<unsigned long>(cps), static_cast<unsigned long>(cpm),
                   static_cast<unsigned long>(total), fps_,
                   static_cast<unsigned long>(g_dropCount.load() - dropOffset_),
-                  calibrating ? 1 : 0);
+                  calibrating ? 1 : 0,
+                  static_cast<unsigned long>(g_maskedCount.load() - maskedOffset_));
     displayStatus(cps, cpm, total, fps_, calibrating);
   }
 
@@ -453,6 +596,7 @@ class Statistics {
   uint32_t lastFrames_ = 0;
   uint32_t totalOffset_ = 0;
   uint32_t dropOffset_ = 0;
+  uint32_t maskedOffset_ = 0;
   float fps_ = 0.0f;
   uint32_t cpsHistory_[kCpmWindow] = {};
   int count_ = 0;
@@ -476,6 +620,7 @@ void printInfo() {
   if (!psramFound()) Serial.println("[ERR] PSRAM not found");
   if (!g_cameraReady) Serial.println("[ERR] camera not initialized");
   printConfig();
+  printMasks();
 }
 
 // "123" のような 0 以上の整数だけを受け付ける
@@ -488,6 +633,42 @@ bool parseValue(const String &text, int minValue, int maxValue, int *value) {
   if (parsed < minValue || parsed > maxValue) return false;
   *value = parsed;
   return true;
+}
+
+// "x,y" をセンサー内の座標として読む
+bool parsePoint(const String &text, int *x, int *y) {
+  const int comma = text.indexOf(',');
+  return comma > 0 && parseValue(text.substring(0, comma), 0, g_width - 1, x) &&
+         parseValue(text.substring(comma + 1), 0, g_height - 1, y);
+}
+
+// m: 一覧 / m=x,y: 追加 / m-=x,y: 削除 / m=clear: 全削除
+void handleMaskCommand(const String &command) {
+  int x = 0;
+  int y = 0;
+  if (command == "m=clear") {
+    clearMasks();
+  } else if (command.startsWith("m-=")) {
+    if (!parsePoint(command.substring(3), &x, &y)) {
+      Serial.printf("[ERR] bad mask point: %s\n", command.c_str());
+      return;
+    }
+    if (!removeMask(x, y)) {
+      Serial.printf("[ERR] no mask at %d,%d\n", x, y);
+      return;
+    }
+  } else if (command.startsWith("m=")) {
+    if (!parsePoint(command.substring(2), &x, &y)) {
+      Serial.printf("[ERR] bad mask point: %s\n", command.c_str());
+      return;
+    }
+    if (!addMask(x, y)) {
+      Serial.printf("[ERR] too many masks (max %d)\n", kMaxMasks);
+      return;
+    }
+  }
+  if (command != "m") saveMasks();
+  printMasks();
 }
 
 void handleCommand(const String &command) {
@@ -511,6 +692,10 @@ void handleCommand(const String &command) {
     Serial.println("[OK] reset");
     return;
   }
+  if (command == "m" || command.startsWith("m=") || command.startsWith("m-=")) {
+    handleMaskCommand(command);
+    return;
+  }
 
   int value = 0;
   const String argument = command.substring(2);
@@ -523,7 +708,8 @@ void handleCommand(const String &command) {
     g_exposure = value;
     g_sensorDirty = true;
   } else {
-    Serial.printf("[ERR] bad command: %s (t=1-255, g=0-%d, e=0-%d, c, r, info)\n",
+    Serial.printf("[ERR] bad command: %s (t=1-255, g=0-%d, e=0-%d, c, r, info, m, m=x,y, "
+                  "m-=x,y, m=clear)\n",
                   command.c_str(), kGainMax, kExposureMax);
     return;
   }
@@ -576,6 +762,7 @@ void setup() {
   digitalWrite(ONBOARD_LED_PIN, LOW);
 
   g_eventQueue = xQueueCreate(kQueueLength, sizeof(RadiationEvent));
+  loadMasks();
   g_cameraReady = startCamera();
   printInfo();
 

@@ -6,8 +6,9 @@ import unittest
 from unittest import mock
 
 import radiat_viewer
-from radiat_viewer import (SUM_BIN_WIDTH, Config, Hit, HitMap, Measurement, Stat, average_cpm,
-                           energy_color, format_elapsed, parse_line, split_lines)
+from radiat_viewer import (SUM_BIN_WIDTH, Config, Hit, HitMap, MaskList, Measurement, Stat,
+                           average_cpm, energy_color, find_repeats, format_elapsed, parse_line,
+                           split_lines)
 
 
 class ParseLineTest(unittest.TestCase):
@@ -19,6 +20,16 @@ class ParseLineTest(unittest.TestCase):
         self.assertEqual(
             parse_line("[STAT] CPS=3, CPM=180, Total=1234, FPS=25.0, Drop=2, Cal=1"),
             Stat(3, 180, 1234, 25.0, 2, True))
+
+    def test_stat_with_masked(self):
+        self.assertEqual(
+            parse_line("[STAT] CPS=3, CPM=180, Total=1234, FPS=25.0, Drop=0, Cal=0, Masked=7"),
+            Stat(3, 180, 1234, 25.0, 0, False, 7))
+
+    def test_mask_list(self):
+        self.assertEqual(parse_line("[MASK] n=2 399,164 10,20"),
+                         MaskList([(399, 164), (10, 20)]))
+        self.assertEqual(parse_line("[MASK] n=0"), MaskList([]))
 
     def test_config(self):
         self.assertEqual(parse_line("[CFG] W=400, H=296, TH=25, GAIN=10, EXP=300"),
@@ -63,6 +74,24 @@ class HitMapTest(unittest.TestCase):
         hitmap.clear()
         self.assertEqual(hitmap.hits, 0)
         self.assertEqual(max(hitmap.counts), 0)
+
+
+class FindRepeatsTest(unittest.TestCase):
+    def test_noise_pixel_wobbling_between_neighbors(self):
+        hits = [Hit(399, 164, 33, 0, 0), Hit(399, 165, 31, 0, 0), Hit(399, 164, 27, 0, 0),
+                Hit(398, 164, 37, 0, 0), Hit(100, 100, 80, 0, 0), Hit(200, 50, 60, 0, 0),
+                Hit(201, 51, 45, 0, 0)]
+        self.assertEqual(find_repeats(hits), [(399, 164, 4, [27, 31, 33, 37]),
+                                              (200, 50, 2, [45, 60])])
+
+    def test_no_repeats(self):
+        self.assertEqual(find_repeats([Hit(1, 1, 30, 0, 0), Hit(5, 5, 30, 0, 0)]), [])
+
+    def test_render_with_masks(self):
+        hitmap = HitMap(400, 296)
+        image = hitmap.render("points", [(399, 164), (0, 0)])
+        self.assertEqual(image.size, hitmap.view_size)
+        self.assertNotEqual(image.getbbox(), None)  # 枠が描かれている
 
 
 class MeasurementTest(unittest.TestCase):

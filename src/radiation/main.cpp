@@ -9,14 +9,14 @@
 // シリアル出力 (1 行 1 メッセージ。tools/radiat_viewer.py の正規表現と一致させること):
 //   [HIT] X=123, Y=45, Energy=67, Sum=210, T=123456
 //   [STAT] CPS=3, CPM=180, Total=1234, FPS=25.0, Drop=0, Cal=0
-//   [CFG] W=400, H=296, TH=25, GAIN=10, EXP=300
+//   [CFG] W=400, H=296, TH=25, GAIN=30, EXP=1200   (起動時の標準設定)
 //   [CAL] start / [CAL] done ...
 // コマンド (改行区切り):
 //   t=30   閾値 (1-255)
 //   g=15   ゲイン (0-30)        ※変更後は自動で再キャリブレーション
 //   e=300  露光時間 (0-1200)    ※変更後は自動で再キャリブレーション
 //   c      再キャリブレーション
-//   r      カウンタとヒットマップのリセット
+//   r      計測のリセット (Total・Drop・CPM とヒットマップ。未送信のヒットも捨てる)
 //   info   設定の再送
 
 #include <Arduino.h>
@@ -66,8 +66,8 @@ bool g_cameraReady = false;
 
 // Core 1 (コマンド) → Core 0 (検出) への設定。センサーへの書き込みは Core 0 だけが行う
 std::atomic<int> g_threshold{25};
-std::atomic<int> g_gain{10};
-std::atomic<int> g_exposure{300};
+std::atomic<int> g_gain{30};
+std::atomic<int> g_exposure{1200};
 std::atomic<bool> g_sensorDirty{false};
 std::atomic<bool> g_calibrationRequested{true};  // 起動直後に 1 回実行する
 std::atomic<bool> g_calibrating{false};
@@ -401,11 +401,14 @@ void displayStatus(uint32_t, uint32_t, uint32_t, float, bool) {}
 
 class Statistics {
  public:
+  // 計測のやり直し。Queue に残っているリセット前のヒットも捨てる
   void reset() {
+    xQueueReset(g_eventQueue);
     lastMs_ = millis();
     lastHits_ = g_hitCount.load();
     lastFrames_ = g_frameCount.load();
     totalOffset_ = lastHits_;
+    dropOffset_ = g_dropCount.load();
     count_ = 0;
     index_ = 0;
   }
@@ -439,7 +442,8 @@ class Statistics {
     Serial.printf("[STAT] CPS=%lu, CPM=%lu, Total=%lu, FPS=%.1f, Drop=%lu, Cal=%d\n",
                   static_cast<unsigned long>(cps), static_cast<unsigned long>(cpm),
                   static_cast<unsigned long>(total), fps_,
-                  static_cast<unsigned long>(g_dropCount.load()), calibrating ? 1 : 0);
+                  static_cast<unsigned long>(g_dropCount.load() - dropOffset_),
+                  calibrating ? 1 : 0);
     displayStatus(cps, cpm, total, fps_, calibrating);
   }
 
@@ -448,6 +452,7 @@ class Statistics {
   uint32_t lastHits_ = 0;
   uint32_t lastFrames_ = 0;
   uint32_t totalOffset_ = 0;
+  uint32_t dropOffset_ = 0;
   float fps_ = 0.0f;
   uint32_t cpsHistory_[kCpmWindow] = {};
   int count_ = 0;

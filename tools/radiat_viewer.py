@@ -26,6 +26,10 @@ from PIL import Image, ImageDraw, ImageFilter
 from camera_viewer import list_ports, open_port
 
 DEFAULT_BAUD = 921600
+# 標準の計測設定 (src/radiation/main.cpp の起動時の値と合わせる)
+DEFAULT_THRESHOLD = 25
+DEFAULT_GAIN = 30
+DEFAULT_EXPOSURE = 1200
 DEFAULT_SENSOR_SIZE = (400, 296)  # src/radiation/main.cpp の kFrameSize (CIF)
 MAP_VIEW_MAX = (640, 480)
 CHART_SIZE = (380, 200)
@@ -260,8 +264,14 @@ class Connection:
 class CsvRecorder:
     def __init__(self):
         LOG_DIR.mkdir(exist_ok=True)
-        self.path = LOG_DIR / f"hits_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-        self._file = self.path.open("w", newline="", encoding="ascii")
+        stem = f"hits_{time.strftime('%Y%m%d_%H%M%S')}"
+        self.path = LOG_DIR / f"{stem}.csv"
+        suffix = 2
+        while self.path.exists():  # 1 秒以内に Reset を続けて押した場合
+            self.path = LOG_DIR / f"{stem}_{suffix}.csv"
+            suffix += 1
+        # 行バッファリングにして、ビューアが落ちても記録済みの行は残るようにする
+        self._file = self.path.open("w", newline="", encoding="ascii", buffering=1)
         self._writer = csv.writer(self._file)
         self._writer.writerow(["pc_time", "esp_ms", "x", "y", "energy", "sum"])
 
@@ -270,6 +280,51 @@ class CsvRecorder:
 
     def close(self):
         self._file.close()
+
+
+def format_elapsed(seconds):
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{sec:02d}" if hours else f"{minutes:02d}:{sec:02d}"
+
+
+def average_cpm(total, seconds):
+    """計測全体の平均 CPM と、その誤差 (√カウント から求めたゆらぎ)。"""
+    if seconds <= 0:
+        return 0.0, 0.0
+    scale = 60 / seconds
+    return total * scale, math.sqrt(total) * scale
+
+
+class Measurement:
+    """Reset (ESP32 の "[OK] reset") から始まる 1 回分の計測。経過時間と CSV を管理する。"""
+
+    def __init__(self, record):
+        self.start = time.monotonic()
+        self.recorder = CsvRecorder() if record else None
+
+    def elapsed(self):
+        return time.monotonic() - self.start
+
+    def record(self, hit):
+        if self.recorder is not None:
+            self.recorder.write(hit)
+
+    def set_recording(self, enabled):
+        """計測の途中で Record CSV を切り替えたとき。閉じたファイルがあればそのパスを返す。"""
+        if enabled and self.recorder is None:
+            self.recorder = CsvRecorder()
+            return None
+        if not enabled:
+            return self.stop_recording()
+        return None
+
+    def stop_recording(self):
+        if self.recorder is None:
+            return None
+        self.recorder.close()
+        path, self.recorder = self.recorder.path, None
+        return path
 
 
 def build_window(view_size):
@@ -287,16 +342,18 @@ def build_window(view_size):
         ],
         [
             sg.Text("Threshold"),
-            sg.Spin(list(range(1, 256)), initial_value=25, key="-TH-", **spin),
+            sg.Spin(list(range(1, 256)), initial_value=DEFAULT_THRESHOLD, key="-TH-", **spin),
             sg.Text("Gain"),
-            sg.Spin(list(range(0, 31)), initial_value=10, key="-GAIN-", **spin),
+            sg.Spin(list(range(0, 31)), initial_value=DEFAULT_GAIN, key="-GAIN-", **spin),
             sg.Text("Exposure"),
-            sg.Spin(list(range(0, 1201, 10)), initial_value=300, key="-EXP-", **spin),
+            sg.Spin(list(range(0, 1201, 10)), initial_value=DEFAULT_EXPOSURE, key="-EXP-", **spin),
             sg.Button("Apply", key="-APPLY-", disabled=True,
                       tooltip="ゲイン/露光を変えると ESP32 側で自動的に再キャリブレーションします"),
             sg.Button("Calibrate", key="-CAL-", disabled=True,
                       tooltip="センサーを遮光した状態で実行 (ダークフレームの取り直し)"),
-            sg.Button("Reset", key="-RESET-", tooltip="カウンタ・ヒットマップ・ヒストグラムを消去"),
+            sg.Button("Reset", key="-RESET-",
+                      tooltip="計測を最初から始める (カウンタ・Drop・表示を消去し、"
+                              "経過時間と CSV ファイルを新しくする)"),
             sg.Button("Info", key="-INFO-", disabled=True),
         ],
         [
@@ -307,10 +364,13 @@ def build_window(view_size):
             sg.Combo(["energy", "sum"], default_value="energy", key="-HISTKIND-",
                      enable_events=True, readonly=True, size=(7, 1)),
             sg.Checkbox("log scale", default=True, key="-LOG_SCALE-", enable_events=True),
-            sg.Checkbox("Record CSV", key="-REC-", enable_events=True),
+            sg.Checkbox("Record CSV", default=True, key="-REC-", enable_events=True,
+                        tooltip="Reset ごとに tools/logs/ へ新しい CSV を作る"),
             sg.Button("Save image", key="-SAVE-"),
             sg.Checkbox("Show HIT/STAT lines", key="-VERBOSE-"),
         ],
+        [sg.Text("", key="-MEASURE-", size=(90, 1), font=("Consolas", 13, "bold"),
+                 text_color="#ffee58")],
         [
             sg.Image(key="-MAP-", size=view_size, background_color="black"),
             sg.Column([
@@ -335,18 +395,51 @@ def main():
     hitmap = HitMap(*DEFAULT_SENSOR_SIZE)
     window = build_window(hitmap.view_size)
     connection = None
-    recorder = None
+    measurement = None  # Reset するまでは None (経過時間・CSV なし)
     config = None
     last_stat = None
     rate_history = collections.deque(maxlen=RATE_HISTORY_S)
     map_dirty = chart_dirty = True
     next_map = next_chart = 0.0
+    measure_text = None
 
     def log(text):
         window["-LOG-"].print(text)
 
+    def clear_view():
+        nonlocal last_stat, map_dirty, chart_dirty
+        hitmap.clear()
+        rate_history.clear()
+        last_stat = None
+        map_dirty = chart_dirty = True
+
+    def log_saved(path):
+        if path is None:
+            return
+        total = last_stat.total if last_stat is not None else "?"
+        drop = last_stat.drop if last_stat is not None else "?"
+        log(f"[PC] saved {path.name} ({format_elapsed(measurement.elapsed())}, "
+            f"Total {total}, PC hits {hitmap.hits}, Drop {drop})")
+
+    def finish_measurement():
+        nonlocal measurement
+        if measurement is not None:
+            log_saved(measurement.stop_recording())
+            measurement = None
+
+    def start_measurement(record):
+        nonlocal measurement
+        finish_measurement()
+        clear_view()
+        measurement = Measurement(record)
+        if measurement.recorder is not None:
+            log(f"[PC] measurement started, recording to {measurement.recorder.path.name}")
+        else:
+            log("[PC] measurement started (CSV off)")
+
     def disconnect():
         nonlocal connection
+        finish_measurement()
         connection.close()
         connection = None
         set_connected(window, False)
@@ -390,20 +483,17 @@ def main():
             connection.send("info")
         elif event == "-RESET-":
             if connection is not None:
+                # 計測は ESP32 から "[OK] reset" が返った時点で始める。
+                # それより後に届いた行は、すべてリセット後のデータになる
                 connection.send("r")
-            hitmap.clear()
-            rate_history.clear()
-            map_dirty = chart_dirty = True
+            else:
+                clear_view()
         elif event in ("-MODE-", "-HISTKIND-", "-LOG_SCALE-"):
             map_dirty = chart_dirty = True
-        elif event == "-REC-":
-            if values["-REC-"]:
-                recorder = CsvRecorder()
-                log(f"[PC] recording to {recorder.path}")
-            elif recorder is not None:
-                recorder.close()
-                log(f"[PC] saved {recorder.path}")
-                recorder = None
+        elif event == "-REC-" and measurement is not None:
+            log_saved(measurement.set_recording(values["-REC-"]))
+            if measurement.recorder is not None:
+                log(f"[PC] recording to {measurement.recorder.path.name}")
         elif event == "-SAVE-":
             SNAPSHOT_DIR.mkdir(exist_ok=True)
             path = SNAPSHOT_DIR / f"hitmap_{time.strftime('%Y%m%d_%H%M%S')}_{values['-MODE-']}.png"
@@ -421,8 +511,8 @@ def main():
                     text, message = value
                     if isinstance(message, Hit):
                         hitmap.add(message)
-                        if recorder is not None:
-                            recorder.write(message)
+                        if measurement is not None:
+                            measurement.record(message)
                         map_dirty = chart_dirty = True
                         if values["-VERBOSE-"]:
                             log(text)
@@ -443,6 +533,9 @@ def main():
                         window["-TH-"].update(value=message.threshold)
                         window["-GAIN-"].update(value=message.gain)
                         window["-EXP-"].update(value=message.exposure)
+                    elif text == "[OK] reset":
+                        log(text)
+                        start_measurement(values["-REC-"])
                     else:
                         log(text)
             except queue.Empty:
@@ -474,12 +567,28 @@ def main():
             if config is not None:
                 status += (f" | {config.width}x{config.height} TH={config.threshold} "
                            f"GAIN={config.gain} EXP={config.exposure}")
-            if recorder is not None:
-                status += " | REC"
             window["-STATUS-"].update(status)
 
-    if recorder is not None:
-        recorder.close()
+        # 計測時間の表示 (文字が変わったときだけ更新する)
+        if measurement is not None:
+            elapsed = measurement.elapsed()
+            total = last_stat.total if last_stat is not None else 0
+            cpm, error = average_cpm(total, elapsed)
+            recording = (f"REC {measurement.recorder.path.name}" if measurement.recorder
+                         else "CSV off")
+            line = (f"Elapsed {format_elapsed(elapsed)} | Total {total} | "
+                    f"Avg {cpm:.1f} ± {error:.1f} CPM | {recording}")
+        elif connection is not None:
+            line = "Reset を押すと計測を開始します"
+        else:
+            line = ""
+        if line != measure_text:
+            window["-MEASURE-"].update(line)
+            measure_text = line
+
+    # ウィンドウは閉じているのでログは出さずに CSV だけ閉じる
+    if measurement is not None:
+        measurement.stop_recording()
     if connection is not None:
         connection.close()
     window.close()

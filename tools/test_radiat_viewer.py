@@ -1,9 +1,13 @@
 """radiat_viewer のテスト。実行: python -m unittest discover tools"""
 
+import pathlib
+import tempfile
 import unittest
+from unittest import mock
 
-from radiat_viewer import (SUM_BIN_WIDTH, Config, Hit, HitMap, Stat, energy_color, parse_line,
-                           split_lines)
+import radiat_viewer
+from radiat_viewer import (SUM_BIN_WIDTH, Config, Hit, HitMap, Measurement, Stat, average_cpm,
+                           energy_color, format_elapsed, parse_line, split_lines)
 
 
 class ParseLineTest(unittest.TestCase):
@@ -59,6 +63,44 @@ class HitMapTest(unittest.TestCase):
         hitmap.clear()
         self.assertEqual(hitmap.hits, 0)
         self.assertEqual(max(hitmap.counts), 0)
+
+
+class MeasurementTest(unittest.TestCase):
+    def test_format_elapsed(self):
+        self.assertEqual(format_elapsed(0), "00:00")
+        self.assertEqual(format_elapsed(299.9), "04:59")
+        self.assertEqual(format_elapsed(3725), "1:02:05")
+
+    def test_average_cpm(self):
+        cpm, error = average_cpm(277, 300)
+        self.assertAlmostEqual(cpm, 55.4)
+        self.assertAlmostEqual(error, 277 ** 0.5 / 5)
+        self.assertEqual(average_cpm(10, 0), (0.0, 0.0))
+
+    def test_csv_is_split_per_measurement(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(radiat_viewer, "LOG_DIR", pathlib.Path(directory)):
+            first = Measurement(record=True)
+            first.record(Hit(1, 2, 30, 40, 1000))
+            first_path = first.stop_recording()
+            second = Measurement(record=True)  # 同じ秒に作っても上書きしない
+            second_path = second.stop_recording()
+            self.assertNotEqual(first_path, second_path)
+            lines = first_path.read_text().splitlines()
+            self.assertEqual(lines[0], "pc_time,esp_ms,x,y,energy,sum")
+            self.assertTrue(lines[1].endswith(",1000,1,2,30,40"))
+            self.assertEqual(len(second_path.read_text().splitlines()), 1)
+
+    def test_recording_can_be_toggled(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(radiat_viewer, "LOG_DIR", pathlib.Path(directory)):
+            measurement = Measurement(record=False)
+            measurement.record(Hit(1, 2, 30, 40, 0))  # CSV off なら何もしない
+            self.assertIsNone(measurement.set_recording(True))
+            self.assertIsNotNone(measurement.recorder)
+            path = measurement.set_recording(False)
+            self.assertTrue(path.exists())
+            self.assertIsNone(measurement.recorder)
 
 
 if __name__ == "__main__":
